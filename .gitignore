@@ -1,0 +1,10 @@
+# Bundler
+/vendor/bundle
+
+# Logs
+*.log
+
+# Temp files
+tmp/
+
+.env
