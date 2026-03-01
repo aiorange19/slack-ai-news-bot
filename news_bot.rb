@@ -6,16 +6,26 @@ require "json"
 require "http"
 require "time"
 require "cgi"
+require "uri"
 
 TIME_ZONE = "Asia/Tokyo"
 JST = "+09:00"
 ENV["TZ"] = TIME_ZONE
 
+encoded_query = URI.encode_www_form_component("AI 人工知能")
 RSS_URLS = [
-  "https://news.google.com/rss/search?q=AI+人工知能&hl=ja&gl=JP&ceid=JP:ja",
-  "https://news.google.com/rss/search?q=AI+machine+learning&hl=en-US&gl=US&ceid=US:en",
+"https://news.google.com/rss/search?q=#{encoded_query}&hl=ja&gl=JP&ceid=JP:ja",
   "https://techcrunch.com/tag/artificial-intelligence/feed/",
-  "https://venturebeat.com/category/ai/feed/"
+  "https://venturebeat.com/category/ai/feed/",
+  "https://www.theverge.com/rss/ai/index.xml",
+  "https://www.technologyreview.com/topic/artificial-intelligence/feed",
+  "https://feeds.arstechnica.com/arstechnica/technology-lab",
+  "https://openai.com/blog/rss.xml",
+  "https://rss.itmedia.co.jp/rss/2.0/news_ai.xml",
+  "https://codezine.jp/rss/new/20/index.xml",
+  "https://www.publickey1.jp/atom.xml",
+  "https://qiita.com/tags/ai/feed.atom",
+  "https://zenn.dev/topics/ai/feed"
 ]
 
 KEYWORDS = %w[OpenAI Google Anthropic LLM GPT Gemini Claude Meta Microsoft].freeze
@@ -33,9 +43,26 @@ end
 # =========================================
 # RSS Fetch
 # =========================================
+def clean_text(raw)
+  return "" if raw.nil? || raw.empty?
+
+  raw = raw.encode("UTF-8", invalid: :replace, undef: :replace)
+
+  text = raw
+           .gsub(/<\/?[^>]*>/, " ")
+  2.times { text = CGI.unescapeHTML(text) }
+  text = text.gsub(/&(nbsp|#160|#xA0);/i, " ")
+  text = text.gsub(/\u00A0/, " ")
+  text = text.gsub(/\s+/, " ").strip
+
+  text
+end
+
 def extract_summary(item, max_length: 200)
   raw = item.respond_to?(:description) ? item.description.to_s : ""
-  text = CGI.unescapeHTML(raw.gsub(/<[^>]*>/, " ").gsub(/\s+/, " ").strip)
+  return "" if raw.empty?
+
+  text = clean_text(raw)
   return "" if text.empty?
 
   text.length > max_length ? "#{text[0...max_length]}..." : text
@@ -46,7 +73,10 @@ def fetch_articles(urls, from_time, to_time)
 
   urls.each do |url|
     begin
-      rss = RSS::Parser.parse(URI.open(url).read, false)
+    rss = RSS::Parser.parse(
+      URI.open(url).read.force_encoding("UTF-8"),
+      false
+    )
     rescue => e
       warn "[RSS ERROR] #{url} #{e.message}"
       next
@@ -59,7 +89,7 @@ def fetch_articles(urls, from_time, to_time)
       next unless pub_time >= from_time && pub_time < to_time
 
       articles << {
-        title: item.title.to_s.strip,
+        title: clean_text(item.title.to_s),
         link: item.link.to_s,
         summary: extract_summary(item),
         published: pub_time
@@ -187,7 +217,7 @@ def build_slack_text(articles, mention: nil)
   lines << ""
 
   articles.each_with_index do |article, i|
-    lines << "#{i + 1}. *#{article[:ja_title]}*"
+    lines << "#{i + 1}. *#{article[:title]}*"
     lines << "   👉 #{article[:summary]}"
     lines << "   🔗 <#{article[:link]}|続きを読む>"
     lines << ""
@@ -197,15 +227,15 @@ def build_slack_text(articles, mention: nil)
 end
 
 def build_slack_blocks(articles)
-  articles.map do |article|
+  [
     {
       type: "section",
       text: {
         type: "mrkdwn",
-        text: build_slack_text(article, mention: "<!here>")
+        text: build_slack_text(articles, mention: "<!here>")
       }
     }
-  end
+  ]
 end
 
 def post_to_slack(articles)
