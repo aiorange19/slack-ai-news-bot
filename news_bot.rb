@@ -7,7 +7,9 @@ require "http"
 require "time"
 require "cgi"
 
+TIME_ZONE = "Asia/Tokyo"
 JST = "+09:00"
+ENV["TZ"] = TIME_ZONE
 
 RSS_URLS = [
   "https://news.google.com/rss/search?q=AI+人工知能&hl=ja&gl=JP&ceid=JP:ja",
@@ -176,12 +178,22 @@ end
 # =========================================
 # Slack Output
 # =========================================
-def build_slack_text(article)
-  [
-    "*#{article[:title]}*",
-    article[:summary],
-    "<#{article[:link]}|続きを読む>"
-  ].reject(&:empty?).join("\n")
+def build_slack_text(articles, mention: nil)
+  lines = []
+  date_str = Time.now.getlocal(JST).strftime("%-m/%-d")
+
+  lines << mention if mention
+  lines << "🧠 *#{date_str}のAIニュース*"
+  lines << ""
+
+  articles.each_with_index do |article, i|
+    lines << "#{i + 1}. *#{article[:ja_title]}*"
+    lines << "   👉 #{article[:summary]}"
+    lines << "   🔗 <#{article[:link]}|続きを読む>"
+    lines << ""
+  end
+
+  lines.join("\n")
 end
 
 def build_slack_blocks(articles)
@@ -190,7 +202,7 @@ def build_slack_blocks(articles)
       type: "section",
       text: {
         type: "mrkdwn",
-        text: build_slack_text(article)
+        text: build_slack_text(article, mention: "<!here>")
       }
     }
   end

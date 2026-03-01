@@ -21,4 +21,5 @@ jobs:
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TZ: Asia/Tokyo
           
