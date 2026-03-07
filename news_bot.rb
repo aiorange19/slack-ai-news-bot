@@ -6,8 +6,10 @@ require "http"
 require "time"
 require "cgi"
 
+# 日本標準時のUTCオフセット
 JST = "+09:00"
 
+# 収集対象のRSSフィードURL一覧
 RSS_URLS = [
   # 海外AIニュース
   "https://techcrunch.com/tag/artificial-intelligence/feed/",
@@ -29,17 +31,24 @@ RSS_URLS = [
   "https://gigazine.net/news/rss_2.0/"
 ]
 
-KEYWORDS = %w[OpenAI Google Anthropic LLM GPT Gemini Claude Meta Microsoft].freeze
+# スコアリングで優先する主要キーワード
+KEYWORDS = %w[OpenAI Google Anthropic LLM GPT Gemini Claude Meta Microsoft AI].freeze
+# 使用するGeminiモデル名（未設定時は軽量モデル）
 GEMINI_MODEL = ENV.fetch("GEMINI_MODEL", "gemini-2.5-flash-lite")
+# 1回の実行で許可するGemini API呼び出し回数の上限
 GEMINI_MAX_CALLS_PER_RUN = ENV.fetch("GEMINI_MAX_CALLS_PER_RUN", "2").to_i
+# 記事本文の抽出時に使う最大文字数
 SUMMARY_SOURCE_MAX_CHARS = 1200
+# 本文候補として採用する段落の最小文字数
 SUMMARY_MIN_PARAGRAPH_CHARS = 40
+# AI関連判定に使う正規表現パターン群
 AI_RELEVANCE_PATTERNS = [
   /(^|[^a-z])ai([^a-z]|$)/i,
   /人工知能|生成AI|生成ai|機械学習|深層学習|大規模言語モデル|LLM|llm/i,
   /OpenAI|Anthropic|Gemini|Claude|GPT|Copilot|DeepSeek|Mistral|Llama|Perplexity/i,
   /画像生成|音声生成|動画生成|RAG|エージェント|推論|推論モデル|ファインチューニング/i
 ].freeze
+# ノイズ文（規約・購読導線など）を除外する正規表現パターン群
 BOILERPLATE_PATTERNS = [
   /cookie/i,
   /プライバシー|利用規約|会員登録|ログイン|サインイン/i,
@@ -186,18 +195,24 @@ def pick_top_articles(articles, limit: 10)
   articles.sort_by { |a| -a[:score] }.first(limit)
 end
 
+# =========================================
+# スコア付けした上位候補から最終採用記事を選定する（必要に応じてGemini選別し、足りない分を補完して重複を除外）
+# =========================================
 def select_final_articles(top_articles, limit: 5)
   return [] if top_articles.empty?
   return top_articles.first(limit) if top_articles.length <= limit
 
+  # 選別と要約に備えてGemini呼び出し枠を温存し、不足時はローカル上位を採用
   if gemini_calls_remaining < 2
     warn "[SELECT WARN] not enough Gemini budget. use local top #{limit}."
     return top_articles.first(limit)
   end
 
+  # Geminiで重要記事を選び、index/title情報から元記事に解決
   selected = gemini_select(top_articles, limit: limit)
   final_articles = resolve_selected_articles(selected, top_articles, limit: limit)
 
+  # 解決できなかった分は未使用の上位候補で補完して件数を満たす
   if final_articles.length < limit
     used_links = final_articles.map { |article| article[:link] }
     refill = top_articles.reject { |article| used_links.include?(article[:link]) }
@@ -205,6 +220,7 @@ def select_final_articles(top_articles, limit: 5)
     final_articles.concat(refill)
   end
 
+  # 最終的に重複を除去し、上限件数に整えて返す
   deduplicate_articles(final_articles).first(limit)
 end
 
@@ -331,12 +347,16 @@ rescue => e
   ""
 end
 
+# 記事HTMLから要約用の可読本文を抽出し、ノイズ除去と文字数調整を行って返す
 def html_to_readable_text(html, max_length: 1200)
+  # HTML文字列を扱いやすい形に正規化
   raw = html.to_s
+  # 本文候補を優先して抽出（article > main > 全文）
   target = raw[/<article\b[^>]*>[\s\S]*?<\/article>/im] ||
            raw[/<main\b[^>]*>[\s\S]*?<\/main>/im] ||
            raw
 
+  # 可読テキスト化の邪魔になる要素を除去
   body = target
          .gsub(/<script[\s\S]*?<\/script>/im, " ")
          .gsub(/<style[\s\S]*?<\/style>/im, " ")
@@ -344,20 +364,24 @@ def html_to_readable_text(html, max_length: 1200)
          .gsub(/<svg[\s\S]*?<\/svg>/im, " ")
          .gsub(/<iframe[\s\S]*?<\/iframe>/im, " ")
 
+  # 段落単位で本文を抽出し、短すぎる文や定型ノイズを除外
   paragraphs = body.scan(/<p\b[^>]*>([\s\S]*?)<\/p>/im).flatten
                    .map { |p| clean_text(p) }
                    .reject { |t| t.length < SUMMARY_MIN_PARAGRAPH_CHARS }
                    .reject { |t| BOILERPLATE_PATTERNS.any? { |pat| t.match?(pat) } }
 
+  # 段落が取れた場合は先頭を連結、取れない場合は本文全体をクリーンアップして使用
   cleaned = if paragraphs.empty?
               clean_text(body)
             else
               paragraphs.first(8).join(" ")
             end
 
+  # 余分な空白を整形し、空なら本文なしとして返す
   cleaned = cleaned.gsub(/\s+/, " ").strip
   return "" if cleaned.empty?
 
+  # 文字数上限に収まるよう、文の切れ目を優先して自然に短縮
   trim_text_naturally(cleaned, max_length: max_length)
 end
 
@@ -375,39 +399,41 @@ def trim_text_naturally(text, max_length: 1200)
   result.strip
 end
 
-def build_local_fallback_summary(article, max_length: 120)
-  title = clean_text(article[:title].to_s)
-  concise = "#{title}に関する更新です。詳細はリンク先でご確認ください。"
-  sanitize_summary_text(concise, max_length: max_length)
-end
-
+# Gemini応答から要約を抽出する（まずJSON解析を試し、不足分は行単位フォーマットを追記解析）
 def parse_summary_lines(raw, size)
   text = raw.to_s
+  # 正式JSON形式（配列/オブジェクト）としての解析を優先
   summaries = parse_summary_json_payload(text, size)
   return summaries if summaries.length >= size
 
+  # JSONで不足した場合は「1: 要約」形式の行を順に解析して補完
   text.each_line do |line|
     parsed = parse_indexed_summary_line(line, size)
     next unless parsed
 
     idx, summary = parsed
     summaries[idx] = summary
+    # 必要件数に達した時点で終了
     break if summaries.length >= size
   end
 
   summaries
 end
 
+# Gemini応答内のJSON部分を取り出し、index付き要約マップ（0始まり）へ正規化する
 def parse_summary_json_payload(raw, size)
+  # 文字列中からJSONらしき塊（オブジェクト/配列）を抽出
   json_part = raw.to_s[/\{[\s\S]*\}|\[[\s\S]*\]/]
   return {} if json_part.to_s.empty?
 
   begin
+    # JSONとして解釈できない場合は空で返し、上位のフォールバックへ回す
     parsed = JSON.parse(json_part)
   rescue
     return {}
   end
 
+  # {"summaries":[...]} と [...] の両形式を受け付ける
   rows = if parsed.is_a?(Hash) && parsed["summaries"].is_a?(Array)
            parsed["summaries"]
          elsif parsed.is_a?(Array)
@@ -418,35 +444,52 @@ def parse_summary_json_payload(raw, size)
 
   summaries = {}
   rows.each do |row|
+    # 各要素はHash前提（それ以外は無視）
     next unless row.is_a?(Hash)
 
+    # index/id/no の別名を許容し、範囲外は除外
     idx = (row["index"] || row["id"] || row["no"]).to_i
     next if idx <= 0 || idx > size
 
+    # summary/text/body の別名を許容し、文面を正規化
     raw_summary = row["summary"] || row["text"] || row["body"]
     summary = sanitize_summary_text(raw_summary.to_s, max_length: 120)
     next if summary.empty?
 
+    # 呼び出し側が扱いやすい0始まりインデックスで保存
     summaries[idx - 1] = summary
   end
 
   summaries
 end
 
+# 1行テキストから「番号付き要約」を抽出し、0始まりindexと要約文に変換する
 def parse_indexed_summary_line(line, size)
   text = line.to_s.strip
   return nil if text.empty?
 
+  # [1] / 1: / 1. / 1) / 1| のような番号付き形式を許容
   matched = text.match(/\A\[*\s*(\d{1,2})\s*\]*\s*(?:\||[:：\-]|[.)])\s*(.+)\z/)
   return nil unless matched
 
+  # indexが有効範囲外なら無視
   idx = matched[1].to_i
   return nil if idx <= 0 || idx > size
 
+  # 要約文を整形し、空になった場合は無視
   summary = sanitize_summary_text(matched[2].to_s, max_length: 120)
   return nil if summary.empty?
 
   [idx - 1, summary]
+end
+
+# =========================================
+# 要約が生成できなかった時用の、フォールバック処理
+# =========================================
+def build_local_fallback_summary(article, max_length: 120)
+  title = clean_text(article[:title].to_s)
+  concise = "#{title}に関する更新です。詳細はリンク先でご確認ください。"
+  sanitize_summary_text(concise, max_length: max_length)
 end
 
 def sanitize_summary_text(text, max_length: 140)
@@ -535,7 +578,7 @@ def call_gemini(prompt, response_mime_type: nil)
     return ""
   end
 
-  warn "[Gemini OK] model=#{GEMINI_MODEL} chars=#{text.length} call_count=#{@gemini_call_count}"
+  puts "[Gemini OK] model=#{GEMINI_MODEL} chars=#{text.length} call_count=#{@gemini_call_count}"
   text
 rescue => e
   warn "[Gemini FAIL] model=#{GEMINI_MODEL} reason=#{truncate_for_log(e.message)}"
