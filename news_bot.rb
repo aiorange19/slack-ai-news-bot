@@ -31,6 +31,7 @@ RSS_URLS = [
 
 KEYWORDS = %w[OpenAI Google Anthropic LLM GPT Gemini Claude Meta Microsoft].freeze
 GEMINI_MODEL = ENV.fetch("GEMINI_MODEL", "gemini-2.5-flash-lite")
+GEMINI_MAX_CALLS_PER_RUN = ENV.fetch("GEMINI_MAX_CALLS_PER_RUN", "2").to_i
 SUMMARY_SOURCE_MAX_CHARS = 1200
 SUMMARY_MIN_PARAGRAPH_CHARS = 40
 AI_RELEVANCE_PATTERNS = [
@@ -51,6 +52,8 @@ BOILERPLATE_PATTERNS = [
 # Orchestration
 # =========================================
 def run
+  @gemini_call_count = 0
+
   from_time, to_time = day_window_jst
 
   articles = fetch_articles(RSS_URLS, from_time, to_time)
@@ -186,6 +189,11 @@ end
 def select_final_articles(top_articles, limit: 5)
   return [] if top_articles.empty?
   return top_articles.first(limit) if top_articles.length <= limit
+
+  if gemini_calls_remaining < 2
+    warn "[SELECT WARN] not enough Gemini budget. use local top #{limit}."
+    return top_articles.first(limit)
+  end
 
   selected = gemini_select(top_articles, limit: limit)
   final_articles = resolve_selected_articles(selected, top_articles, limit: limit)
@@ -483,8 +491,16 @@ end
 # Gemini Common Caller
 # =========================================
 def call_gemini(prompt, response_mime_type: nil)
+  if gemini_call_limit_reached?
+    warn "[Gemini FAIL] call_limit_reached count=#{@gemini_call_count}"
+    return ""
+  end
+
   api_key = ENV["GEMINI_API_KEY"]
-  raise "GEMINI_API_KEY missing" if api_key.to_s.strip.empty?
+  if api_key.to_s.strip.empty?
+    warn "[Gemini FAIL] GEMINI_API_KEY missing"
+    return ""
+  end
 
   generation_config = {
     temperature: 0.2,
@@ -499,12 +515,51 @@ def call_gemini(prompt, response_mime_type: nil)
       generationConfig: generation_config
     }
   )
+  increment_gemini_call_count
+
+  unless response.status.success?
+    warn "[Gemini FAIL] model=#{GEMINI_MODEL} status=#{response.status}"
+    return ""
+  end
 
   result = JSON.parse(response.body.to_s)
-  result.dig("candidates", 0, "content", "parts", 0, "text").to_s
+  if result["error"]
+    msg = result.dig("error", "message").to_s
+    warn "[Gemini FAIL] model=#{GEMINI_MODEL} api_error=#{truncate_for_log(msg)}"
+    return ""
+  end
+
+  text = result.dig("candidates", 0, "content", "parts", 0, "text").to_s
+  if text.strip.empty?
+    warn "[Gemini FAIL] model=#{GEMINI_MODEL} empty_response"
+    return ""
+  end
+
+  warn "[Gemini OK] model=#{GEMINI_MODEL} chars=#{text.length} call_count=#{@gemini_call_count}"
+  text
 rescue => e
-  warn "[Gemini ERROR] #{e.message}"
+  warn "[Gemini FAIL] model=#{GEMINI_MODEL} reason=#{truncate_for_log(e.message)}"
   ""
+end
+
+def gemini_call_limit_reached?
+  current = @gemini_call_count.to_i
+  limit = GEMINI_MAX_CALLS_PER_RUN.positive? ? GEMINI_MAX_CALLS_PER_RUN : 2
+  current >= limit
+end
+
+def gemini_calls_remaining
+  limit = GEMINI_MAX_CALLS_PER_RUN.positive? ? GEMINI_MAX_CALLS_PER_RUN : 2
+  [limit - @gemini_call_count.to_i, 0].max
+end
+
+def increment_gemini_call_count
+  @gemini_call_count = @gemini_call_count.to_i + 1
+end
+
+def truncate_for_log(text, max_length: 300)
+  clean = text.to_s.gsub(/\s+/, " ").strip
+  clean.length > max_length ? "#{clean[0...max_length]}..." : clean
 end
 
 # =========================================
