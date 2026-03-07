@@ -5,11 +5,11 @@ require "json"
 require "http"
 require "time"
 require "cgi"
-require "uri"
 
-TIME_ZONE = "Asia/Tokyo"
+# 日本標準時のUTCオフセット
 JST = "+09:00"
 
+# 収集対象のRSSフィードURL一覧
 RSS_URLS = [
   # 海外AIニュース
   "https://techcrunch.com/tag/artificial-intelligence/feed/",
@@ -27,19 +27,70 @@ RSS_URLS = [
   "https://blog.google/technology/ai/rss/",
 
   # 日本
-  "https://rss.itmedia.co.jp/rss/2.0/news_ai.xml",
   "https://www.publickey1.jp/atom.xml",
   "https://gigazine.net/news/rss_2.0/"
 ]
 
-KEYWORDS = %w[OpenAI Google Anthropic LLM GPT Gemini Claude Meta Microsoft].freeze
-GEMINI_MODEL = ENV.fetch("GEMINI_MODEL", "gemini-2.0-flash")
+# スコアリングで優先する主要キーワード
+KEYWORDS = %w[OpenAI Google Anthropic LLM GPT Gemini Claude Meta Microsoft AI].freeze
+# 使用するGeminiモデル名（未設定時は軽量モデル）
+GEMINI_MODEL = ENV.fetch("GEMINI_MODEL", "gemini-2.5-flash-lite")
+# 1回の実行で許可するGemini API呼び出し回数の上限
+GEMINI_MAX_CALLS_PER_RUN = ENV.fetch("GEMINI_MAX_CALLS_PER_RUN", "2").to_i
+# 記事本文の抽出時に使う最大文字数
+SUMMARY_SOURCE_MAX_CHARS = 1200
+# 本文候補として採用する段落の最小文字数
+SUMMARY_MIN_PARAGRAPH_CHARS = 40
+# AI関連判定に使う正規表現パターン群
 AI_RELEVANCE_PATTERNS = [
   /(^|[^a-z])ai([^a-z]|$)/i,
   /人工知能|生成AI|生成ai|機械学習|深層学習|大規模言語モデル|LLM|llm/i,
   /OpenAI|Anthropic|Gemini|Claude|GPT|Copilot|DeepSeek|Mistral|Llama|Perplexity/i,
   /画像生成|音声生成|動画生成|RAG|エージェント|推論|推論モデル|ファインチューニング/i
 ].freeze
+# ノイズ文（規約・購読導線など）を除外する正規表現パターン群
+BOILERPLATE_PATTERNS = [
+  /cookie/i,
+  /プライバシー|利用規約|会員登録|ログイン|サインイン/i,
+  /広告|スポンサー|購読|ニュースレター/i,
+  /subscribe|subscription|sign in|log in/i,
+  /この記事をシェア|関連記事|おすすめ記事/i
+].freeze
+
+# =========================================
+# Orchestration
+# =========================================
+def run
+  @gemini_call_count = 0
+
+  from_time, to_time = day_window_jst
+
+  articles = fetch_articles(RSS_URLS, from_time, to_time)
+  articles = deduplicate_articles(articles)
+
+  add_scores(articles)
+  top_articles = pick_top_articles(articles, limit: 10)
+  final_articles = select_final_articles(top_articles, limit: 5)
+
+  # 要約生成（タイトルとリンクをもとにまとめて1回）
+  summaries = generate_summaries(final_articles)
+  if summaries.length < final_articles.length
+    warn "[SUMMARY WARN] generated=#{summaries.length}/#{final_articles.length} fallback=#{final_articles.length - summaries.length}"
+  end
+
+  final_articles.each_with_index do |article, idx|
+    article[:summary] = summaries[idx] || build_local_fallback_summary(article)
+  end
+
+  if final_articles.empty?
+    warn "[INFO] No publishable articles for this run. Slack post skipped."
+    return
+  end
+
+  post_to_slack(final_articles)
+end
+
+private
 
 # =========================================
 # Time Window (JST stateless)
@@ -52,94 +103,8 @@ def day_window_jst
 end
 
 # =========================================
-# RSS Fetch
+# RSSフィードを巡回し、指定したJST時間窓内の記事かつAI_RELEVANCE_PATTERNSに該当したものを収集して返す
 # =========================================
-def clean_text(raw)
-  return "" if raw.nil? || raw.empty?
-
-  raw = raw.encode("UTF-8", invalid: :replace, undef: :replace)
-
-  text = raw
-           .gsub(/<\/?[^>]*>/, " ")
-  2.times { text = CGI.unescapeHTML(text) }
-  text = text.gsub(/&(nbsp|#160|#xA0);/i, " ")
-  text = text.gsub(/\u00A0/, " ")
-  text = text.gsub(/\s+/, " ").strip
-
-  text
-end
-
-BOILERPLATE_PATTERNS = [
-  /親愛なる読者/i,
-  /サーバー運営がとても苦しい/i,
-  /運営継続/i,
-  /ご支援|寄付|カンパ/i,
-  /広告ブロック/i,
-  /ユーザー名|パスワード/i,
-  /ユーザー名\s*パスワード\s*-\s*パスワードの再発行/i,
-  /ログイン|サインイン|パスワードの再発行/i
-].freeze
-
-def ai_related_text?(text)
-  t = text.to_s
-  AI_RELEVANCE_PATTERNS.any? { |pattern| t.match?(pattern) }
-end
-
-def extract_text_from_html(html, max_length: 2500)
-  return "" if html.to_s.empty?
-
-  target = html[/<article\b[^>]*>[\s\S]*?<\/article>/i] || html
-  cleaned = target.dup
-  cleaned.gsub!(/<script\b[^>]*>[\s\S]*?<\/script>/i, " ")
-  cleaned.gsub!(/<style\b[^>]*>[\s\S]*?<\/style>/i, " ")
-  cleaned.gsub!(/<noscript\b[^>]*>[\s\S]*?<\/noscript>/i, " ")
-  cleaned.gsub!(/<!--[\s\S]*?-->/, " ")
-
-  paragraphs = cleaned.scan(/<p\b[^>]*>([\s\S]*?)<\/p>/i).flatten.map { |p| clean_text(p) }
-  paragraphs.reject!(&:empty?)
-  paragraphs.reject! { |p| BOILERPLATE_PATTERNS.any? { |pattern| p.match?(pattern) } }
-
-  text = if paragraphs.empty?
-           clean_text(cleaned)
-         else
-           clean_text(paragraphs.join(" "))
-         end
-
-  BOILERPLATE_PATTERNS.each do |pattern|
-    text = text.gsub(pattern, " ")
-  end
-  text = text.gsub(/\A(?:\s|-|ユーザー名|パスワード|ログイン|サインイン|パスワードの再発行)+/i, " ")
-  text = text.gsub(/\s+/, " ").strip
-
-  return "" if text.empty?
-  text.length > max_length ? text[0...max_length] : text
-end
-
-def fetch_article_body(url, max_length: 2500)
-  return "" if url.to_s.empty?
-
-  html = HTTP
-         .headers("User-Agent" => "Mozilla/5.0 (compatible; AI-News-Bot/1.0)")
-         .timeout(connect: 8, read: 12, write: 8)
-         .follow(max_hops: 5)
-         .get(url)
-         .to_s
-  extract_text_from_html(html, max_length: max_length)
-rescue => e
-  warn "[ARTICLE FETCH ERROR] #{url} #{e.message}"
-  ""
-end
-
-def usable_article_text?(text)
-  t = clean_text(text.to_s)
-  return false if t.empty?
-  return false if t.length < 120
-  return false if BOILERPLATE_PATTERNS.any? { |pattern| t.match?(pattern) }
-  return false unless ai_related_text?(t)
-
-  true
-end
-
 def fetch_articles(urls, from_time, to_time)
   articles = []
 
@@ -165,19 +130,26 @@ def fetch_articles(urls, from_time, to_time)
         next unless pub_time >= from_time && pub_time < to_time
 
         title = clean_text(item.title.to_s)
+        feed_summary = if item.respond_to?(:description) && item.description
+                         clean_text(item.description.to_s)
+                       else
+                         ""
+                       end
         categories = if item.respond_to?(:categories) && item.categories
                        item.categories.map(&:to_s).join(" ")
                      else
                        ""
                      end
         source_text = [title, categories].join(" ")
+        # AI特化ソースURLか本文のAI関連キーワードのどちらかに該当した記事のみ残す
         ai_focused_source = url.match?(/artificial-intelligence|\/ai\/|news_ai|technology\/ai|openai\.com\/blog\/rss|anthropic\.com\/news\/rss/i)
         next if !ai_focused_source && !ai_related_text?(source_text)
 
         articles << {
           title: title,
           link: item.link.to_s,
-          published: pub_time
+          published: pub_time,
+          feed_summary: feed_summary
         }
       rescue => e
         warn "[RSS ITEM ERROR] #{url} #{e.message}"
@@ -189,23 +161,29 @@ def fetch_articles(urls, from_time, to_time)
   articles
 end
 
-# =========================================
-# Deduplication
-# =========================================
-def normalize_title(text)
-  text.to_s.downcase.gsub(/[^a-z0-9ぁ-んァ-ン一-龥]/, "")
+# nbsp等の不要な文字列を削除
+def clean_text(raw)
+  return "" if raw.nil? || raw.empty?
+
+  raw = raw.encode("UTF-8", invalid: :replace, undef: :replace)
+
+  text = raw
+           .gsub(/<\/?[^>]*>/, " ")
+  2.times { text = CGI.unescapeHTML(text) }
+  text = text.gsub(/&(nbsp|#160|#xA0);/i, " ")
+  text = text.gsub(/\u00A0/, " ")
+  text = text.gsub(/\s+/, " ").strip
+
+  text
 end
 
-def deduplicate_articles(articles)
-  seen = {}
-  articles.reject do |article|
-    key = normalize_title(article[:title])
-    seen[key] ? true : (seen[key] = true; false)
-  end
+def ai_related_text?(text)
+  t = text.to_s
+  AI_RELEVANCE_PATTERNS.any? { |pattern| t.match?(pattern) }
 end
 
 # =========================================
-# Scoring
+# スコア付け（タイトル内のキーワード一致数で優先度を決める）
 # =========================================
 def add_scores(articles)
   articles.each do |article|
@@ -218,108 +196,300 @@ def pick_top_articles(articles, limit: 10)
 end
 
 # =========================================
-# Gemini Common Caller
+# スコア付けした上位候補から最終採用記事を選定する（必要に応じてGemini選別し、足りない分を補完して重複を除外）
 # =========================================
-def call_gemini(prompt)
-  api_key = ENV["GEMINI_API_KEY"]
-  raise "GEMINI_API_KEY missing" if api_key.to_s.empty?
+def select_final_articles(top_articles, limit: 5)
+  return [] if top_articles.empty?
+  return top_articles.first(limit) if top_articles.length <= limit
 
-  response = HTTP.post(
-    "https://generativelanguage.googleapis.com/v1beta/models/#{GEMINI_MODEL}:generateContent?key=#{api_key}",
-    json: {
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: {
-        temperature: 0.2,
-        maxOutputTokens: 2000
-      }
-    }
-  )
+  # 選別と要約に備えてGemini呼び出し枠を温存し、不足時はローカル上位を採用
+  if gemini_calls_remaining < 2
+    warn "[SELECT WARN] not enough Gemini budget. use local top #{limit}."
+    return top_articles.first(limit)
+  end
 
-  result = JSON.parse(response.body.to_s)
-  result.dig("candidates", 0, "content", "parts", 0, "text").to_s
-rescue => e
-  warn "[Gemini ERROR] #{e.message}"
-  ""
+  # Geminiで重要記事を選び、index/title情報から元記事に解決
+  selected = gemini_select(top_articles, limit: limit)
+  final_articles = resolve_selected_articles(selected, top_articles, limit: limit)
+
+  # 解決できなかった分は未使用の上位候補で補完して件数を満たす
+  if final_articles.length < limit
+    used_links = final_articles.map { |article| article[:link] }
+    refill = top_articles.reject { |article| used_links.include?(article[:link]) }
+                         .first(limit - final_articles.length)
+    final_articles.concat(refill)
+  end
+
+  # 最終的に重複を除去し、上限件数に整えて返す
+  deduplicate_articles(final_articles).first(limit)
 end
 
-# =========================================
-# Gemini: 意味重複排除 + 5件選定
-# =========================================
-def build_selection_prompt(articles)
+def gemini_select(articles, limit: 5)
+  raw = call_gemini(build_selection_prompt(articles, limit: limit), response_mime_type: "application/json")
+  parse_selection_json(raw, limit: limit)
+rescue => e
+  warn "[SELECT WARN] fallback local due to parse error: #{e.message}"
+  articles.first(limit).map.with_index(1) { |article, idx| { "index" => idx, "title" => article[:title] } }
+end
+
+def build_selection_prompt(articles, limit: 5)
   <<~TEXT
-    以下のニュースタイトルがあります。
-    内容が実質同じニュースは1つにまとめ、
-    重要なものを5件選び、
-    JSON配列のみで返してください。
+    次のニュース候補から重要度の高い#{limit}件を選んでください。
+    意味が重複する候補は1件にまとめてください。
+    出力はJSON配列のみ。各要素は index と title を含めてください。
 
     [
       {"index": 1, "title": "..."}
     ]
 
-    #{articles.map.with_index(1) { |a, i| "#{i}. #{a[:title]}" }.join("\n")}
+    #{articles.map.with_index(1) { |article, idx| "#{idx}. #{article[:title]}" }.join("\n")}
   TEXT
 end
 
-def gemini_select(articles)
-  return [] if articles.empty?
+def parse_selection_json(raw, limit: 5)
+  json_text = raw.to_s[/\[[\s\S]*\]/]
+  raise "selection json not found" if json_text.to_s.empty?
 
-  raw = call_gemini(build_selection_prompt(articles))
+  parsed = JSON.parse(json_text)
+  raise "selection json is not array" unless parsed.is_a?(Array)
 
-  json_text = raw[/\[[\s\S]*\]/]
-  JSON.parse(json_text)
-rescue
-  articles.first(5).map.with_index(1) { |a, i| { "index" => i, "title" => a[:title] } }
+  parsed.first(limit).map do |row|
+    {
+      "index" => row["index"],
+      "title" => row["title"]
+    }
+  end
 end
 
-def resolve_selected_articles(selected, candidates)
+def resolve_selected_articles(selected, candidates, limit: 5)
   resolved = selected.map do |sel|
     idx = sel["index"].to_i
     if idx.positive? && idx <= candidates.length
       candidates[idx - 1]
     else
       wanted = normalize_title(sel["title"])
-      candidates.find { |a| normalize_title(a[:title]) == wanted }
+      candidates.find { |article| normalize_title(article[:title]) == wanted }
     end
   end.compact
 
-  deduplicate_articles(resolved)
+  deduplicate_articles(resolved).first(limit)
 end
 
 # =========================================
 # Gemini: 要約生成
 # =========================================
+def generate_summaries(articles)
+  return {} if articles.empty?
+
+  articles.each do |article|
+    source_text = fetch_article_source_text(article[:link])
+    source_text = article[:feed_summary].to_s if source_text.empty?
+    article[:source_text] = source_text
+  end
+
+  raw = call_gemini(build_batch_summary_prompt(articles), response_mime_type: "application/json")
+  parse_summary_lines(raw, articles.length)
+rescue
+  {}
+end
+
 def build_batch_summary_prompt(articles)
   blocks = articles.map.with_index(1) do |article, idx|
+    source_text = article[:source_text].to_s.strip
+    source_text = "（本文取得失敗。タイトルのみで要約）" if source_text.empty?
+
     <<~TEXT
       [#{idx}]
       タイトル: #{article[:title]}
-      本文抜粋: #{article[:article_text]}
+      リンク: #{article[:link]}
+      本文抜粋: #{source_text}
       ---
     TEXT
   end.join("\n")
 
   <<~TEXT
-    次のニュース本文を読み、各記事の要点を日本語で短く作成してください。
+    次のニュース情報（タイトル・本文抜粋）を根拠に、各記事の要点を日本語で短く作成してください。
+    本文抜粋にある事実（固有名詞・数字・変更点）を優先し、推測はしないでください。
+    リンクURLの文字列そのものを根拠にしないでください。
+    本文抜粋が「（本文取得失敗。タイトルのみで要約）」のときだけ、タイトルから推定して要約してください。
     要約は80〜120文字を目安に、1〜2文で完結してください。
     必ず「。」で終わらせてください。
+    文体は、ニュースをおすすめする紹介文として、やわらかい「です・ます調」にしてください。
+    断定的で硬い行政文書のような言い回し（例: 〜である、〜とされる）を避けてください。
     タイトルの言い換えは禁止。
     固有名詞・数字・変更点を優先。
     曖昧表現は禁止。
     媒体名・著者名・配信日時などのメタ情報は禁止。
-    英語は禁止。日本語のみ。
+    出力は日本語のみ。ただし固有名詞（組織名・製品名・人物名）は原文の英語表記を許可。
     「...」「…」は禁止。
-    出力形式は必ず次の行形式のみ（前置き禁止・コードブロック禁止）。
-
-    1|要約
-    2|要約
-    3|要約
+    出力は必ずJSONのみ（前置き禁止・コードブロック禁止）。
+    必ず全件分（index 1〜#{articles.length}）を含めてください。
+    JSON形式:
+    {"summaries":[{"index":1,"summary":"要約"}, {"index":2,"summary":"要約"}]}
 
     #{blocks}
   TEXT
 end
 
-def japanese_text?(text)
-  text.to_s.match?(/[ぁ-んァ-ン一-龥]/)
+def fetch_article_source_text(url)
+  return "" if url.to_s.empty?
+
+  html = HTTP
+         .headers("User-Agent" => "Mozilla/5.0 (compatible; AI-News-Bot/1.0)")
+         .timeout(connect: 8, read: 12, write: 8)
+         .follow(max_hops: 5)
+         .get(url)
+         .to_s
+
+  html_to_readable_text(html, max_length: SUMMARY_SOURCE_MAX_CHARS)
+rescue => e
+  warn "[ARTICLE FETCH ERROR] #{url} #{e.message}"
+  ""
+end
+
+# 記事HTMLから要約用の可読本文を抽出し、ノイズ除去と文字数調整を行って返す
+def html_to_readable_text(html, max_length: 1200)
+  # HTML文字列を扱いやすい形に正規化
+  raw = html.to_s
+  # 本文候補を優先して抽出（article > main > 全文）
+  target = raw[/<article\b[^>]*>[\s\S]*?<\/article>/im] ||
+           raw[/<main\b[^>]*>[\s\S]*?<\/main>/im] ||
+           raw
+
+  # 可読テキスト化の邪魔になる要素を除去
+  body = target
+         .gsub(/<script[\s\S]*?<\/script>/im, " ")
+         .gsub(/<style[\s\S]*?<\/style>/im, " ")
+         .gsub(/<noscript[\s\S]*?<\/noscript>/im, " ")
+         .gsub(/<svg[\s\S]*?<\/svg>/im, " ")
+         .gsub(/<iframe[\s\S]*?<\/iframe>/im, " ")
+
+  # 段落単位で本文を抽出し、短すぎる文や定型ノイズを除外
+  paragraphs = body.scan(/<p\b[^>]*>([\s\S]*?)<\/p>/im).flatten
+                   .map { |p| clean_text(p) }
+                   .reject { |t| t.length < SUMMARY_MIN_PARAGRAPH_CHARS }
+                   .reject { |t| BOILERPLATE_PATTERNS.any? { |pat| t.match?(pat) } }
+
+  # 段落が取れた場合は先頭を連結、取れない場合は本文全体をクリーンアップして使用
+  cleaned = if paragraphs.empty?
+              clean_text(body)
+            else
+              paragraphs.first(8).join(" ")
+            end
+
+  # 余分な空白を整形し、空なら本文なしとして返す
+  cleaned = cleaned.gsub(/\s+/, " ").strip
+  return "" if cleaned.empty?
+
+  # 文字数上限に収まるよう、文の切れ目を優先して自然に短縮
+  trim_text_naturally(cleaned, max_length: max_length)
+end
+
+def trim_text_naturally(text, max_length: 1200)
+  cleaned = text.to_s.strip
+  return cleaned if cleaned.length <= max_length
+
+  sentences = cleaned.split(/(?<=[。！？.!?])/)
+  result = ""
+  sentences.each do |sentence|
+    break if (result + sentence).length > max_length
+    result += sentence
+  end
+  result = cleaned[0...max_length] if result.strip.empty?
+  result.strip
+end
+
+# Gemini応答から要約を抽出する（まずJSON解析を試し、不足分は行単位フォーマットを追記解析）
+def parse_summary_lines(raw, size)
+  text = raw.to_s
+  # 正式JSON形式（配列/オブジェクト）としての解析を優先
+  summaries = parse_summary_json_payload(text, size)
+  return summaries if summaries.length >= size
+
+  # JSONで不足した場合は「1: 要約」形式の行を順に解析して補完
+  text.each_line do |line|
+    parsed = parse_indexed_summary_line(line, size)
+    next unless parsed
+
+    idx, summary = parsed
+    summaries[idx] = summary
+    # 必要件数に達した時点で終了
+    break if summaries.length >= size
+  end
+
+  summaries
+end
+
+# Gemini応答内のJSON部分を取り出し、index付き要約マップ（0始まり）へ正規化する
+def parse_summary_json_payload(raw, size)
+  # 文字列中からJSONらしき塊（オブジェクト/配列）を抽出
+  json_part = raw.to_s[/\{[\s\S]*\}|\[[\s\S]*\]/]
+  return {} if json_part.to_s.empty?
+
+  begin
+    # JSONとして解釈できない場合は空で返し、上位のフォールバックへ回す
+    parsed = JSON.parse(json_part)
+  rescue
+    return {}
+  end
+
+  # {"summaries":[...]} と [...] の両形式を受け付ける
+  rows = if parsed.is_a?(Hash) && parsed["summaries"].is_a?(Array)
+           parsed["summaries"]
+         elsif parsed.is_a?(Array)
+           parsed
+         else
+           []
+         end
+
+  summaries = {}
+  rows.each do |row|
+    # 各要素はHash前提（それ以外は無視）
+    next unless row.is_a?(Hash)
+
+    # index/id/no の別名を許容し、範囲外は除外
+    idx = (row["index"] || row["id"] || row["no"]).to_i
+    next if idx <= 0 || idx > size
+
+    # summary/text/body の別名を許容し、文面を正規化
+    raw_summary = row["summary"] || row["text"] || row["body"]
+    summary = sanitize_summary_text(raw_summary.to_s, max_length: 120)
+    next if summary.empty?
+
+    # 呼び出し側が扱いやすい0始まりインデックスで保存
+    summaries[idx - 1] = summary
+  end
+
+  summaries
+end
+
+# 1行テキストから「番号付き要約」を抽出し、0始まりindexと要約文に変換する
+def parse_indexed_summary_line(line, size)
+  text = line.to_s.strip
+  return nil if text.empty?
+
+  # [1] / 1: / 1. / 1) / 1| のような番号付き形式を許容
+  matched = text.match(/\A\[*\s*(\d{1,2})\s*\]*\s*(?:\||[:：\-]|[.)])\s*(.+)\z/)
+  return nil unless matched
+
+  # indexが有効範囲外なら無視
+  idx = matched[1].to_i
+  return nil if idx <= 0 || idx > size
+
+  # 要約文を整形し、空になった場合は無視
+  summary = sanitize_summary_text(matched[2].to_s, max_length: 120)
+  return nil if summary.empty?
+
+  [idx - 1, summary]
+end
+
+# =========================================
+# 要約が生成できなかった時用の、フォールバック処理
+# =========================================
+def build_local_fallback_summary(article, max_length: 120)
+  title = clean_text(article[:title].to_s)
+  concise = "#{title}に関する更新です。詳細はリンク先でご確認ください。"
+  sanitize_summary_text(concise, max_length: max_length)
 end
 
 def sanitize_summary_text(text, max_length: 140)
@@ -345,62 +515,121 @@ def sanitize_summary_text(text, max_length: 140)
   result.strip
 end
 
-def build_local_fallback_summary(article, max_length: 120)
-  source = article[:article_text].to_s
-  source = article[:title].to_s if source.empty?
-
-  text = clean_text(source)
-  text = text
-           .gsub(/^[^。]{0,60}(編集部|記者|著)[^。]*。?/i, "")
-           .gsub(/\b\d{4}\/\d{1,2}\/\d{1,2}[^。]*。?/, "")
-           .gsub(/\b\d{1,2}:\d{2}\b/, "")
-           .strip
-  if article[:article_text].to_s.empty? || text.empty?
-    return "本文を取得できませんでした。リンク先の記事をご確認ください。"
+# =========================================
+# 重複除去（タイトルを正規化して同一記事を1件にまとめる）
+# =========================================
+def deduplicate_articles(articles)
+  seen = {}
+  articles.reject do |article|
+    key = normalize_title(article[:title])
+    seen[key] ? true : (seen[key] = true; false)
   end
-
-  sentences = text.split(/(?<=[。！？])/).map(&:strip).reject(&:empty?)
-  concise = sentences[0].to_s
-  concise = text if concise.empty?
-
-  unless japanese_text?(concise)
-    title = clean_text(article[:title].to_s)
-    concise = "#{title}に関する更新です。詳細はリンク先でご確認ください。"
-  end
-
-  sanitize_summary_text(concise, max_length: max_length)
 end
 
-def parse_summary_lines(raw, size)
-  summaries = {}
-  raw.to_s.each_line do |line|
-    matched = line.strip.match(/\A(\d{1,2})\s*\|\s*(.+)\z/)
-    next unless matched
-
-    idx = matched[1].to_i
-    next if idx <= 0 || idx > size
-
-    summary = sanitize_summary_text(matched[2].to_s, max_length: 120)
-    next if summary.empty? || !japanese_text?(summary)
-
-    summaries[idx - 1] = summary
-  end
-  summaries
+def normalize_title(text)
+  text.to_s.downcase.gsub(/[^a-z0-9ぁ-んァ-ン一-龥]/, "")
 end
 
-def generate_summaries(articles)
-  return {} if articles.empty?
+# =========================================
+# Gemini Common Caller
+# =========================================
+def call_gemini(prompt, response_mime_type: nil)
+  if gemini_call_limit_reached?
+    warn "[Gemini FAIL] call_limit_reached count=#{@gemini_call_count}"
+    return ""
+  end
 
-  raw = call_gemini(build_batch_summary_prompt(articles))
-  summaries = parse_summary_lines(raw, articles.length)
-  summaries
-rescue
-  {}
+  api_key = ENV["GEMINI_API_KEY"]
+  if api_key.to_s.strip.empty?
+    warn "[Gemini FAIL] GEMINI_API_KEY missing"
+    return ""
+  end
+
+  generation_config = {
+    temperature: 0.2,
+    maxOutputTokens: 2000
+  }
+  generation_config[:responseMimeType] = response_mime_type if response_mime_type.to_s != ""
+
+  response = HTTP.post(
+    "https://generativelanguage.googleapis.com/v1beta/models/#{GEMINI_MODEL}:generateContent?key=#{api_key}",
+    json: {
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: generation_config
+    }
+  )
+  increment_gemini_call_count
+
+  unless response.status.success?
+    warn "[Gemini FAIL] model=#{GEMINI_MODEL} status=#{response.status}"
+    return ""
+  end
+
+  result = JSON.parse(response.body.to_s)
+  if result["error"]
+    msg = result.dig("error", "message").to_s
+    warn "[Gemini FAIL] model=#{GEMINI_MODEL} api_error=#{truncate_for_log(msg)}"
+    return ""
+  end
+
+  text = result.dig("candidates", 0, "content", "parts", 0, "text").to_s
+  if text.strip.empty?
+    warn "[Gemini FAIL] model=#{GEMINI_MODEL} empty_response"
+    return ""
+  end
+
+  puts "[Gemini OK] model=#{GEMINI_MODEL} chars=#{text.length} call_count=#{@gemini_call_count}"
+  text
+rescue => e
+  warn "[Gemini FAIL] model=#{GEMINI_MODEL} reason=#{truncate_for_log(e.message)}"
+  ""
+end
+
+def gemini_call_limit_reached?
+  current = @gemini_call_count.to_i
+  limit = GEMINI_MAX_CALLS_PER_RUN.positive? ? GEMINI_MAX_CALLS_PER_RUN : 2
+  current >= limit
+end
+
+def gemini_calls_remaining
+  limit = GEMINI_MAX_CALLS_PER_RUN.positive? ? GEMINI_MAX_CALLS_PER_RUN : 2
+  [limit - @gemini_call_count.to_i, 0].max
+end
+
+def increment_gemini_call_count
+  @gemini_call_count = @gemini_call_count.to_i + 1
+end
+
+def truncate_for_log(text, max_length: 300)
+  clean = text.to_s.gsub(/\s+/, " ").strip
+  clean.length > max_length ? "#{clean[0...max_length]}..." : clean
 end
 
 # =========================================
 # Slack Output
 # =========================================
+def post_to_slack(articles)
+  webhook = ENV["SLACK_WEBHOOK_URL"]
+  raise "SLACK_WEBHOOK_URL missing" if webhook.to_s.empty?
+
+  blocks = build_slack_blocks(articles)
+  res = HTTP.post(webhook, json: { blocks: blocks })
+  warn "[Slack ERROR] status=#{res.status}" unless res.status.success?
+  res.status.success?
+end
+
+def build_slack_blocks(articles)
+  [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: build_slack_text(articles, mention: "<!here>")
+      }
+    }
+  ]
+end
+
 def build_slack_text(articles, mention: nil)
   lines = []
   date_str = Time.now.getlocal(JST).strftime("%-m/%-d")
@@ -417,73 +646,6 @@ def build_slack_text(articles, mention: nil)
   end
 
   lines.join("\n")
-end
-
-def build_slack_blocks(articles)
-  [
-    {
-      type: "section",
-      text: {
-        type: "mrkdwn",
-        text: build_slack_text(articles, mention: "<!here>")
-      }
-    }
-  ]
-end
-
-def post_to_slack(articles)
-  webhook = ENV["SLACK_WEBHOOK_URL"]
-  raise "SLACK_WEBHOOK_URL missing" if webhook.to_s.empty?
-
-  blocks = build_slack_blocks(articles)
-  res = HTTP.post(webhook, json: { blocks: blocks })
-  warn "[Slack ERROR] status=#{res.status}" unless res.status.success?
-  res.status.success?
-end
-
-# =========================================
-# Orchestration
-# =========================================
-def run
-  from_time, to_time = day_window_jst
-
-  articles = fetch_articles(RSS_URLS, from_time, to_time)
-  articles = deduplicate_articles(articles)
-
-  add_scores(articles)
-  top_articles = pick_top_articles(articles, limit: 10)
-
-  # 本文を先に取得し、本文が実用的な候補のみを選定対象にする
-  top_articles.each do |article|
-    article[:article_text] = fetch_article_body(article[:link])
-  end
-
-  body_ready_articles = top_articles.select { |a| usable_article_text?(a[:article_text]) }
-
-  selected = gemini_select(body_ready_articles)
-  final_articles = resolve_selected_articles(selected, body_ready_articles)
-
-  # 件数不足時は上位候補から補充（重複除外）
-  if final_articles.length < 5
-    used_links = final_articles.map { |a| a[:link] }
-    refill = body_ready_articles.reject { |a| used_links.include?(a[:link]) }
-                       .select { |a| usable_article_text?(a[:article_text]) }
-                       .first(5 - final_articles.length)
-    final_articles.concat(refill)
-  end
-
-  # 要約生成（本文ベース・まとめて1回）
-  summaries = generate_summaries(final_articles)
-  final_articles.each_with_index do |article, idx|
-    article[:summary] = summaries[idx] || build_local_fallback_summary(article)
-  end
-
-  if final_articles.empty?
-    warn "[INFO] No publishable articles for this run. Slack post skipped."
-    return
-  end
-
-  post_to_slack(final_articles)
 end
 
 run

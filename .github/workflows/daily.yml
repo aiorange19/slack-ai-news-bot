@@ -2,7 +2,7 @@ name: AI News Bot
 
 on:
   schedule:
-    - cron: "0 0 * * *"
+    - cron: "45 20 * * *" # UTC 20:45 = JST 05:45（遅延を見込んで朝7時前後狙い）
   workflow_dispatch:
 
 jobs:
